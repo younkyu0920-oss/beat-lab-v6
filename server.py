@@ -58,7 +58,7 @@ def features(y):
 @app.get('/')
 def index(): return send_from_directory(ROOT/'web','index.html')
 @app.get('/api/health')
-def health(): return jsonify(ok=True,engine='FFmpeg + NumPy 6.1',version='6.1')
+def health(): return jsonify(ok=True,engine='FFmpeg + NumPy 6.1',version='7.0',music_enabled=bool(os.getenv('MUSICGEN_ENDPOINT') and os.getenv('HF_TOKEN') and os.getenv('STUDIO_ACCESS_CODE')))
 @app.errorhandler(413)
 def too_large(e): return jsonify(error='파일은 30MB 이하로 선택하세요.'),413
 @app.post('/api/analyze')
@@ -78,5 +78,35 @@ def analyze():
     except subprocess.TimeoutExpired: return jsonify(error='오디오 변환 시간 초과. 짧은 녹음으로 다시 시도하세요.'),504
     except Exception:
         app.logger.exception('Audio analysis failed'); return jsonify(error='분석 엔진 오류. Render Logs를 확인하세요.'),500
+    finally: lock.release()
+# Optional dedicated MusicGen endpoint; credentials never appear in the browser.
+import json, urllib.request, urllib.error, io, wave, hmac
+from flask import send_file
+@app.post('/api/music')
+def music():
+    endpoint=os.getenv('MUSICGEN_ENDPOINT',''); token=os.getenv('HF_TOKEN',''); secret=os.getenv('STUDIO_ACCESS_CODE','')
+    if not endpoint.startswith('https://') or not token or not secret:
+        return jsonify(error='MusicGen GPU endpoint, HF_TOKEN, STUDIO_ACCESS_CODE 설정 필요'),503
+    if not hmac.compare_digest(request.headers.get('X-Studio-Code',''),secret):
+        return jsonify(error='접근 코드가 올바르지 않습니다.'),403
+    data=request.get_json(silent=True) or {}; prompt=str(data.get('prompt','')).strip()[:600]
+    if not prompt: return jsonify(error='음악 설명을 입력하세요.'),400
+    if not lock.acquire(blocking=False): return jsonify(error='다른 작업 진행 중'),429
+    try:
+        req=urllib.request.Request(endpoint,data=json.dumps({'inputs':prompt}).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+        with urllib.request.urlopen(req,timeout=150) as r:
+            raw=r.read(12*1024*1024+1)
+        if len(raw)>12*1024*1024: raise ValueError('response too large')
+        if raw[:4]==b'RIFF': return send_file(io.BytesIO(raw),mimetype='audio/wav')
+        obj=json.loads(raw); item=obj[0] if isinstance(obj,list) else obj
+        values=item.get('generated_audio',item.get('generated_text'))
+        a=np.asarray(values,dtype=np.float32).squeeze()
+        if a.ndim!=1 or not 0<len(a)<=32000*30 or not np.isfinite(a).all(): raise ValueError('bad audio')
+        buf=io.BytesIO()
+        with wave.open(buf,'wb') as w:
+            w.setnchannels(1);w.setsampwidth(2);w.setframerate(32000);w.writeframes((np.clip(a,-1,1)*32767).astype('<i2').tobytes())
+        buf.seek(0);return send_file(buf,mimetype='audio/wav')
+    except Exception:
+        app.logger.exception('Music endpoint failure');return jsonify(error='MusicGen 요청 실패: endpoint 상태와 응답 형식을 확인하세요.'),502
     finally: lock.release()
 if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
